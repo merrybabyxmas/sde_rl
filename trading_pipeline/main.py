@@ -2,10 +2,11 @@ import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import threading
 import asyncio
 import random
 import collections
+import traceback
+from config.settings import Config
 from src.models.sde_model import LatentSDE
 from src.models.rl_agent import TradingAgent
 from src.data.collector import RealTimeDataCollector
@@ -14,58 +15,46 @@ from src.utils.training import train_sde_warmup
 
 class TradingPipeline:
     def __init__(self):
+        # Validate Config
+        Config.validate()
+        print(f"Initializing Pipeline in {Config.MODE} mode...")
+
         # Dimensions
-        # Collector now returns 22 dims: 20 (Norm Features) + 1 (Latency) + 1 (Abs Price)
-        # SDE and Agent should see: 20 (Market) + 1 (Latency) = 21 dims usually?
-        # Or should we exclude Abs Price from Model Input? Yes.
-        # Agent Input: 21 (Feats + Latency)
-        self.raw_dim = 22
-        self.state_dim = 21
-        self.latent_dim = 8
-        self.portfolio_dim = 2
-        self.action_dim = 1
+        self.state_dim = Config.STATE_DIM
+        self.latent_dim = Config.LATENT_DIM
+        self.portfolio_dim = Config.PORTFOLIO_DIM
+        self.action_dim = Config.ACTION_DIM
 
         # Models
         self.old_model = TradingAgent(self.state_dim, self.action_dim, self.latent_dim, self.portfolio_dim)
         self.new_model = TradingAgent(self.state_dim, self.action_dim, self.latent_dim, self.portfolio_dim)
         self.sde_predictor = LatentSDE(input_dim=self.state_dim, latent_dim=self.latent_dim)
 
-        self.optimizer = optim.Adam(self.new_model.parameters(), lr=1e-4)
+        self.optimizer = optim.Adam(self.new_model.parameters(), lr=Config.RL_LEARNING_RATE)
 
-        # Data (Start in MOCK for safety, change to REAL in code or config if needed)
-        self.data_collector = RealTimeDataCollector(mode="MOCK")
+        # Data Collector
+        self.data_collector = RealTimeDataCollector(mode=Config.MODE)
 
         self.performance_history = {"old": [], "new": []}
         self.replay_buffer = []
-        self.training_batch_size = 20
+        self.training_batch_size = Config.RL_BATCH_SIZE
 
+        # State Tracking
         self.p_state_old = {"cash": 1000.0, "asset": 0.0, "total": 1000.0, "avg_entry_price": 0.0}
         self.p_state_new = {"cash": 1000.0, "asset": 0.0, "total": 1000.0, "avg_entry_price": 0.0}
 
-        # Commission Rate (0.1%)
-        self.COMMISSION_RATE = 0.001
-
         self.running = False
 
-    def start_data_collection(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(self.data_collector.connect())
-
-    def update_portfolio(self, p_state, action_weight, current_price, latency):
+    async def update_portfolio(self, p_state, action_weight, current_price, latency, is_real_execution=False):
         """
         Updates portfolio with Commission and Stop-Loss logic.
+        If is_real_execution is True, it executes orders via data_collector.
         """
         # --- HARD STOP-LOSS CHECK ---
-        # If holding asset and price dropped > 5% below avg_entry_price -> Force Sell All
         if p_state["asset"] > 0 and p_state["avg_entry_price"] > 0:
             loss_pct = (p_state["avg_entry_price"] - current_price) / p_state["avg_entry_price"]
-            if loss_pct > 0.05:
-                # Force Sell Triggered
-                # Override action to 0.0 (Sell All)
-                action_weight = 0.0
-                # Could log this event
-                # print("!!! HARD STOP-LOSS TRIGGERED !!!")
+            if loss_pct > Config.STOP_LOSS_THRESHOLD:
+                action_weight = 0.0 # Force Sell
 
         prev_total = p_state["cash"] + p_state["asset"] * current_price
 
@@ -74,100 +63,96 @@ class TradingPipeline:
 
         diff_value = target_asset_value - current_asset_value
 
+        # Slippage calculation (for simulation/reward)
         slippage_pct = latency * 0.001
-
         if diff_value > 0:
-            executed_price = current_price * (1 + slippage_pct)
+            sim_exec_price = current_price * (1 + slippage_pct)
         else:
-            executed_price = current_price * (1 - slippage_pct)
+            sim_exec_price = current_price * (1 - slippage_pct)
 
         slippage_cost = 0.0
         commission_cost = 0.0
 
-        if abs(diff_value) > 1.0:
-            if diff_value > 0: # Buy
-                amount_to_buy = diff_value / executed_price
-                cost = amount_to_buy * executed_price
+        # Execution Logic
+        if abs(diff_value) > 1.0: # Minimum trade size $1
 
-                # Apply Commission (on top of cost or reduced from amount? usually deducted from cash or asset)
-                # Let's say we pay fees in Quote currency (Cash) for Buy? Or asset?
-                # Standard: Buy 1 BTC, pay 0.001 BTC fee -> get 0.999 BTC.
-                # Let's deduct fee from bought amount.
+            # Real Execution Order
+            if is_real_execution and Config.MODE == 'REAL':
+                side = 'buy' if diff_value > 0 else 'sell'
+                # quantity = abs(diff_value) / current_price # Estimate quantity
+                # Better to use fetched balance? But let's rely on internal state tracking for sync
+                qty_to_trade = abs(diff_value) / current_price
+
+                # Execute Order
+                # We await here since we are in async function now
+                order = await self.data_collector.create_order(side, qty_to_trade)
+                if order:
+                    # Sync state with real execution if possible, or assume fill
+                    # Ideally we fetch balance, but for now we update internal state based on assumed fill
+                    # to keep 'old' and 'new' models consistent in logic.
+                    # Or we could just print:
+                    print(f"REAL EXECUTION: {side} {qty_to_trade:.6f} @ ~{current_price}")
+
+            # Simulation / State Update Logic
+            if diff_value > 0: # Buy
+                amount_to_buy = diff_value / sim_exec_price
+                cost = amount_to_buy * sim_exec_price
 
                 if p_state["cash"] >= cost:
                     p_state["cash"] -= cost
-
-                    # Commission
-                    fee_amount = amount_to_buy * self.COMMISSION_RATE
+                    fee_amount = amount_to_buy * Config.COMMISSION_RATE
                     net_amount = amount_to_buy - fee_amount
-                    commission_cost = fee_amount * executed_price
+                    commission_cost = fee_amount * sim_exec_price
 
-                    # Update Avg Entry
                     total_qty = p_state["asset"] + net_amount
                     if total_qty > 0:
-                        p_state["avg_entry_price"] = (p_state["asset"] * p_state["avg_entry_price"] + net_amount * executed_price) / total_qty
-
+                        p_state["avg_entry_price"] = (p_state["asset"] * p_state["avg_entry_price"] + net_amount * sim_exec_price) / total_qty
                     p_state["asset"] += net_amount
-                    slippage_cost = (executed_price - current_price) * amount_to_buy
+                    slippage_cost = (sim_exec_price - current_price) * amount_to_buy
 
                 else:
-                    # Max buy
                     cost = p_state["cash"]
-                    amount_to_buy = cost / executed_price
+                    amount_to_buy = cost / sim_exec_price
                     p_state["cash"] = 0.0
 
-                    fee_amount = amount_to_buy * self.COMMISSION_RATE
+                    fee_amount = amount_to_buy * Config.COMMISSION_RATE
                     net_amount = amount_to_buy - fee_amount
-                    commission_cost = fee_amount * executed_price
+                    commission_cost = fee_amount * sim_exec_price
 
                     total_qty = p_state["asset"] + net_amount
                     if total_qty > 0:
-                        p_state["avg_entry_price"] = (p_state["asset"] * p_state["avg_entry_price"] + net_amount * executed_price) / total_qty
-
+                        p_state["avg_entry_price"] = (p_state["asset"] * p_state["avg_entry_price"] + net_amount * sim_exec_price) / total_qty
                     p_state["asset"] += net_amount
-                    slippage_cost = (executed_price - current_price) * amount_to_buy
+                    slippage_cost = (sim_exec_price - current_price) * amount_to_buy
 
             else: # Sell
-                amount_to_sell = abs(diff_value) / executed_price
+                amount_to_sell = abs(diff_value) / sim_exec_price
 
                 if p_state["asset"] >= amount_to_sell:
                     p_state["asset"] -= amount_to_sell
-                    proceeds = amount_to_sell * executed_price
-
-                    # Commission (deduct from proceeds)
-                    fee_val = proceeds * self.COMMISSION_RATE
+                    proceeds = amount_to_sell * sim_exec_price
+                    fee_val = proceeds * Config.COMMISSION_RATE
                     net_proceeds = proceeds - fee_val
                     commission_cost = fee_val
-
                     p_state["cash"] += net_proceeds
-                    slippage_cost = (current_price - executed_price) * amount_to_sell
+                    slippage_cost = (current_price - sim_exec_price) * amount_to_sell
                 else:
                     amount_to_sell = p_state["asset"]
                     p_state["asset"] = 0.0
                     p_state["avg_entry_price"] = 0.0
 
-                    proceeds = amount_to_sell * executed_price
-                    fee_val = proceeds * self.COMMISSION_RATE
+                    proceeds = amount_to_sell * sim_exec_price
+                    fee_val = proceeds * Config.COMMISSION_RATE
                     net_proceeds = proceeds - fee_val
                     commission_cost = fee_val
 
                     p_state["cash"] += net_proceeds
-                    slippage_cost = (current_price - executed_price) * amount_to_sell
+                    slippage_cost = (current_price - sim_exec_price) * amount_to_sell
 
         new_total = p_state["cash"] + p_state["asset"] * current_price
-
-        # Reward:
-        # We explicitly punish Commission + Slippage via Wealth Change.
-        # Wealth Change = new_total - prev_total
-        # This already accounts for commission (cash/asset reduced) and slippage (worse price).
-        # So raw_profit/loss captures it.
-
-        # To make Agent "aware", the reward signal matches this reality.
-        # We pass total cost (slip + comm) for logging/aux penalty if desired.
         total_cost = slippage_cost + commission_cost
 
         reward = calculate_reward(prev_total, new_total, total_cost, volatility=0.0)
-
         p_state["total"] = new_total
         return reward, p_state
 
@@ -205,99 +190,106 @@ class TradingPipeline:
         recent_new = sum(self.performance_history["new"][-100:])
         return recent_new > recent_old * 1.05 and recent_new > 0
 
-    def run(self):
+    async def run_async(self):
         self.running = True
-        t = threading.Thread(target=self.start_data_collection)
-        t.daemon = True
-        t.start()
+
+        # Start Data Collector in Background
+        # We need to run it concurrently.
+        # Ideally, we create a task for collector.connect()
+        collector_task = asyncio.create_task(self.data_collector.connect())
 
         print("Waiting for data buffer to fill...")
-        while len(self.data_collector.buffer) < 50: time.sleep(0.1)
+        while len(self.data_collector.buffer) < 50:
+            await asyncio.sleep(0.1)
 
         print("Starting SDE Warm-up...")
-        buffer_data = self.data_collector.get_buffer() # [T, 22]
+        buffer_data = self.data_collector.get_buffer()
         if buffer_data is not None and len(buffer_data) > 10:
-            # Slice only the 21 feature dims for SDE (ignore abs price at -1)
-            # data = buffer_data[:, :-1]
-            # No, -2 is Latency, -1 is Price.
-            # features = buffer_data[:, :21] (Indices 0..20 are feats + latency)
-            # wait. `extract_features`:
-            # 20 feats (0..19)
-            # 20: Latency
-            # 21: Abs Price
-            # So dims 0..20 is 21 dimensions.
-
-            feats = buffer_data[:, :21]
+            feats = buffer_data[:, :Config.STATE_DIM]
             x = feats[:-1]
             y = feats[1:]
-            dt = feats[:-1, -1] # Latency is at index 20
+            dt = feats[:-1, -1]
             loader = [(x, dt, y)]
-            train_sde_warmup(self.sde_predictor, loader, epochs=5)
+            try:
+                # SDE Warmup is CPU bound / synchronous, so we run it directly
+                train_sde_warmup(self.sde_predictor, loader, epochs=Config.SDE_WARMUP_EPOCHS)
+            except Exception as e:
+                print(f"SDE Warmup Failed: {e}")
 
         print("Starting Trading Loop...")
 
         try:
             while self.running:
-                market_data = self.data_collector.get_latest_data() # [22]
+                try:
+                    market_data = self.data_collector.get_latest_data()
 
-                # Separate Abs Price
-                abs_price = market_data[-1].item()
-                # Features for Model
-                state_vec = market_data[:21]
-                latency = state_vec[-1].item()
+                    abs_price = market_data[-1].item()
+                    state_vec = market_data[:Config.STATE_DIM]
+                    latency = state_vec[-1].item()
 
-                state = state_vec.unsqueeze(0) # [1, 21]
+                    state = state_vec.unsqueeze(0)
 
-                with torch.no_grad():
-                    future_dist = self.sde_predictor(state, latency)
+                    with torch.no_grad():
+                        future_dist = self.sde_predictor(state, latency)
 
-                p_vec_old = torch.tensor([self.p_state_old["cash"], self.p_state_old["asset"]]).float().unsqueeze(0)
-                p_vec_new = torch.tensor([self.p_state_new["cash"], self.p_state_new["asset"]]).float().unsqueeze(0)
+                    p_vec_old = torch.tensor([self.p_state_old["cash"], self.p_state_old["asset"]]).float().unsqueeze(0)
+                    p_vec_new = torch.tensor([self.p_state_new["cash"], self.p_state_new["asset"]]).float().unsqueeze(0)
 
-                # OLD
-                with torch.no_grad():
-                    action_old, _, _ = self.old_model.get_action(state, future_dist, p_vec_old, deterministic=True)
+                    # OLD (Production Model) - Executes Real Trades
+                    with torch.no_grad():
+                        action_old, _, _ = self.old_model.get_action(state, future_dist, p_vec_old, deterministic=True)
 
-                reward_old, self.p_state_old = self.update_portfolio(
-                    self.p_state_old, action_old.item(), abs_price, latency
-                )
+                    reward_old, self.p_state_old = await self.update_portfolio(
+                        self.p_state_old, action_old.item(), abs_price, latency, is_real_execution=True
+                    )
 
-                # NEW
-                action_new, log_prob_new, _ = self.new_model.get_action(state, future_dist, p_vec_new, deterministic=False)
+                    # NEW (Challenger Model) - Simulation Only
+                    action_new, log_prob_new, _ = self.new_model.get_action(state, future_dist, p_vec_new, deterministic=False)
 
-                reward_new, self.p_state_new = self.update_portfolio(
-                    self.p_state_new, action_new.item(), abs_price, latency
-                )
+                    reward_new, self.p_state_new = await self.update_portfolio(
+                        self.p_state_new, action_new.item(), abs_price, latency, is_real_execution=False
+                    )
 
-                self.replay_buffer.append((
-                    state[0], future_dist[0], p_vec_new[0], action_new[0], reward_new, log_prob_new[0]
-                ))
+                    self.replay_buffer.append((
+                        state[0], future_dist[0], p_vec_new[0], action_new[0], reward_new, log_prob_new[0]
+                    ))
 
-                self.train_step_rl()
+                    self.train_step_rl()
 
-                self.performance_history["old"].append(reward_old)
-                self.performance_history["new"].append(reward_new)
+                    self.performance_history["old"].append(reward_old)
+                    self.performance_history["new"].append(reward_new)
 
-                if len(self.performance_history["new"]) % 20 == 0:
-                    print(f"Step: {len(self.performance_history['new'])} | "
-                          f"Price: {abs_price:.2f} | "
-                          f"Wealth Old: {self.p_state_old['total']:.2f} | "
-                          f"Wealth New: {self.p_state_new['total']:.2f} | "
-                          f"Action New: {action_new.item():.2f}")
+                    if len(self.performance_history["new"]) % 20 == 0:
+                        print(f"Step: {len(self.performance_history['new'])} | "
+                              f"Price: {abs_price:.2f} | "
+                              f"Wealth Old: {self.p_state_old['total']:.2f} | "
+                              f"Wealth New: {self.p_state_new['total']:.2f} | "
+                              f"Action New: {action_new.item():.2f}")
 
-                if self.should_replace_model():
-                    print(">>> REPLACING MODEL <<<")
-                    self.old_model.load_state_dict(self.new_model.state_dict())
-                    self.performance_history["old"] = []
-                    self.performance_history["new"] = []
-                    self.p_state_old = self.p_state_new.copy()
+                    if self.should_replace_model():
+                        print(">>> REPLACING MODEL <<<")
+                        self.old_model.load_state_dict(self.new_model.state_dict())
+                        self.performance_history["old"] = []
+                        self.performance_history["new"] = []
+                        self.p_state_old = self.p_state_new.copy()
 
-                time.sleep(0.1)
+                except Exception as e:
+                    print(f"Loop Error: {e}")
+                    traceback.print_exc()
 
-        except KeyboardInterrupt:
+                await asyncio.sleep(0.1)
+
+        except asyncio.CancelledError:
             print("Stopping...")
             self.running = False
+        finally:
+            self.running = False
+            await self.data_collector.close()
 
 if __name__ == "__main__":
     pipeline = TradingPipeline()
-    pipeline.run()
+    # Run Async Loop
+    try:
+        asyncio.run(pipeline.run_async())
+    except KeyboardInterrupt:
+        pass

@@ -3,3 +3,4 @@ torchsde
 pandas
 websockets
 numpy
+ccxt
