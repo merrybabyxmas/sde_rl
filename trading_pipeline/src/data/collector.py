@@ -3,12 +3,13 @@ import json
 import time
 import random
 import torch
-# import websockets # Commented out to avoid import error if not installed, but kept for structure
+# import websockets # Kept for structure
 
 class RealTimeDataCollector:
     def __init__(self, symbol="BTCUSDT", mock=False):
         self.symbol = symbol.lower()
-        self.url = f"wss://stream.binance.com:9443/ws/{self.symbol}@depth10@100ms"
+        # Depth 20 to get enough data for Top-5
+        self.url = f"wss://stream.binance.com:9443/ws/{self.symbol}@depth20@100ms"
         self.buffer = []
         self.current_latency = 0.005 # Initial value 5ms
         self.mock = mock
@@ -34,19 +35,23 @@ class RealTimeDataCollector:
 
     async def _run_mock(self):
         while True:
-            # Simulate a message
             now = time.time()
-            # Mock data structure matching Binance depth update
-            data = {
-                'E': (now - self.current_latency) * 1000, # Event time
-                'b': [[str(50000 + random.random()*100), "1.0"]],
-                'a': [[str(50000 + random.random()*100 + 10), "1.0"]]
-            }
-            # Simulate network delay variability
-            await asyncio.sleep(0.1)
-            self.current_latency = 0.005 + random.random() * 0.01 # Random latency between 5ms and 15ms
+            # Mock data: 5 levels of bids and asks
+            # [Price, Qty]
+            base_price = 50000.0 + (random.random() - 0.5) * 100
 
-            # Process as if received
+            bids = [[str(base_price - i*5 - random.random()), str(1.0 + random.random())] for i in range(5)]
+            asks = [[str(base_price + 5 + i*5 + random.random()), str(1.0 + random.random())] for i in range(5)]
+
+            data = {
+                'E': (now - self.current_latency) * 1000,
+                'b': bids,
+                'a': asks
+            }
+
+            await asyncio.sleep(0.1)
+            self.current_latency = max(0.001, 0.005 + (random.random() - 0.5) * 0.002)
+
             msg = json.dumps(data)
             self._process_message(msg, received_time=time.time())
 
@@ -56,36 +61,55 @@ class RealTimeDataCollector:
 
         data = json.loads(msg)
 
-        # Latency calculation: current time - exchange event time
         event_time = data.get('E', received_time * 1000)
-        # recv_time is in seconds, event_time is in ms
         self.current_latency = max(0, (received_time - event_time / 1000.0))
 
-        # Process [bid_price, bid_qty, ask_price, ask_qty, latency]
         processed_data = self.preprocess(data)
         self.buffer.append(processed_data)
 
-        if len(self.buffer) > 1000:
+        if len(self.buffer) > 2000: # Larger buffer for warm-up
             self.buffer.pop(0)
 
     def preprocess(self, data):
-        # Top-1 bid/ask and latency
-        try:
-            best_bid = float(data['b'][0][0])
-            bid_qty = float(data['b'][0][1])
-            best_ask = float(data['a'][0][0])
-            ask_qty = float(data['a'][0][1])
-        except (KeyError, IndexError):
-            # Fallback for empty or malformed data
-            best_bid = 50000.0
-            bid_qty = 1.0
-            best_ask = 50010.0
-            ask_qty = 1.0
+        # Extract Top-5 Bids and Asks
+        # Flattened: [Bid1_P, Bid1_Q, ..., Bid5_P, Bid5_Q, Ask1_P, Ask1_Q, ..., Ask5_P, Ask5_Q, Latency]
+        # Total 5*2 + 5*2 + 1 = 21 dimensions
 
-        return torch.tensor([best_bid, bid_qty, best_ask, ask_qty, self.current_latency], dtype=torch.float32)
+        feature_list = []
+
+        # Bids
+        bids = data.get('b', [])
+        for i in range(5):
+            if i < len(bids):
+                feature_list.append(float(bids[i][0])) # Price
+                feature_list.append(float(bids[i][1])) # Qty
+            else:
+                feature_list.append(0.0)
+                feature_list.append(0.0)
+
+        # Asks
+        asks = data.get('a', [])
+        for i in range(5):
+            if i < len(asks):
+                feature_list.append(float(asks[i][0])) # Price
+                feature_list.append(float(asks[i][1])) # Qty
+            else:
+                feature_list.append(0.0)
+                feature_list.append(0.0)
+
+        feature_list.append(self.current_latency)
+
+        return torch.tensor(feature_list, dtype=torch.float32)
 
     def get_latest_data(self):
         if not self.buffer:
-            # Return dummy data if buffer empty
-            return torch.tensor([50000.0, 1.0, 50010.0, 1.0, 0.005], dtype=torch.float32)
+            # Return dummy data if buffer empty (21 dims)
+            dummy = [50000.0, 1.0] * 10 + [0.005]
+            return torch.tensor(dummy, dtype=torch.float32)
         return self.buffer[-1]
+
+    def get_buffer(self):
+        # Return stacked buffer for training
+        if not self.buffer:
+            return None
+        return torch.stack(self.buffer)

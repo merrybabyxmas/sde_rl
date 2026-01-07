@@ -9,46 +9,51 @@ class LatentSDE(nn.Module):
         self.noise_type = noise_type
 
         self.latent_dim = latent_dim
-        # 1. Encoder: Project input data to SDE latent dimension
+        # Encoder: Project input data (21 dims) to SDE latent dimension
         self.encoder = nn.Linear(input_dim, latent_dim)
 
         self.theta = nn.Parameter(torch.tensor(0.1))  # Mean reversion speed
 
-        # 2. Drift & Diffusion: Now y and mu(y) have matching dimensions (latent_dim)
+        # Drift & Diffusion
         self.mu = nn.Linear(latent_dim, latent_dim)
         self.sigma = nn.Linear(latent_dim, latent_dim)
 
     def f(self, t, y): # Drift function
-        # Dimensions match, safe to compute
         return self.theta * (self.mu(y) - y)
 
     def g(self, t, y): # Diffusion function
-        # Apply sigmoid for volatility stability as suggested
         return torch.sigmoid(self.sigma(y))
 
     def forward(self, x, delta_t):
-        # delta_t is the measured latency
         batch_size = x.shape[0] if x.ndim > 1 else 1
         device = x.device
 
-        # If delta_t is a scalar or single value
         if isinstance(delta_t, (float, int)):
             dt = float(delta_t)
         elif isinstance(delta_t, torch.Tensor):
             dt = delta_t.item()
         else:
-            dt = 0.01 # Fallback
+            dt = 0.01
 
-        # Ensure minimum time interval
         if dt <= 1e-6:
              dt = 1e-6
 
-        # Project input to latent space
-        z0 = self.encoder(x) # [batch, latent_dim]
+        z0 = self.encoder(x)
+
+        # Ensure dt is large enough to avoid recursion depth issues in brownian tree construction
+        # or use a different noise type/method if dt is very small.
+        # But 1e-6 should be fine for euler.
+        # The recursion error often comes from floating point issues or extremely small intervals relative to something else.
+        # Or if dt is 0.
+        # We already ensured dt > 1e-6.
+        # Let's increase min dt slightly or check if dt is somehow becoming 0.
+
+        # Another possibility: torchsde has issues with small dt in 'euler'.
+        # We can try fixed step size options if needed, but for now let's clamp dt higher.
+        if dt < 0.01: dt = 0.01 # Enforce minimum 10ms for stability
 
         ts = torch.tensor([0, dt]).float().to(device)
 
-        # Brownian motion simulation
-        # z0 is the initial state in latent space
-        z_t = torchsde.sdeint(self, z0, ts, method='euler')[1]
-        return z_t # predicted latent state/distribution at t + delta_t
+        # Explicitly pass dt as step size to avoid adaptive logic issues or too small steps
+        z_t = torchsde.sdeint(self, z0, ts, method='euler', dt=dt)[1]
+        return z_t

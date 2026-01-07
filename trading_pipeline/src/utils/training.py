@@ -53,10 +53,25 @@ def train_sde_warmup(sde_model, train_loader, epochs=50, device="cpu"):
             # Let's fix the forward to handle batch dt correctly or just use mean.
             dt = batch_dt.mean()
 
+            # Project batch_y to latent space if necessary
+            # The SDE model outputs latent state (dim 8), but batch_y is raw data (dim 21).
+            # We should train the SDE to predict the future LATENT state.
+            # But we only have raw data.
+            # Approach: SDE Model should probably output back to data space (Decoder) if it is a generative model.
+            # Or, for this specific pipeline where SDE is used for feature extraction,
+            # we can train it to minimize reconstruction loss of the future state.
+            # However, the current LatentSDE class doesn't have a decoder.
+            # To fix the immediate error and make it meaningful:
+            # We will use the encoder to project batch_y to latent space and use that as target.
+            # This trains the SDE to predict the *latent representation* of the future.
+
+            with torch.no_grad():
+                target_latent = sde_model.encoder(batch_y)
+
             pred_y = sde_model(batch_x, dt)
 
-            # pred_y shape [batch, dim]
-            loss = criterion(pred_y, batch_y)
+            # pred_y shape [batch, latent_dim], target_latent [batch, latent_dim]
+            loss = criterion(pred_y, target_latent)
             loss.backward()
             optimizer.step()
 
