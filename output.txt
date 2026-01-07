@@ -1,2 +1,2 @@
 Pipeline started. Waiting for data...
-[REAL] Action: 0, Price: 50059.52
+[REAL] Action: 2, Price: 50050.02, Exec: 50064.11, Reward: -1.4103
