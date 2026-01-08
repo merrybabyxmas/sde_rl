@@ -12,6 +12,7 @@ from src.models.rl_agent import TradingAgent
 from src.data.collector import RealTimeDataCollector
 from src.strategy.reward import calculate_reward
 from src.utils.training import train_sde_warmup
+from src.utils.visualizer import TradingVisualizer
 
 class TradingPipeline:
     def __init__(self):
@@ -42,6 +43,9 @@ class TradingPipeline:
         # State Tracking
         self.p_state_old = {"cash": 1000.0, "asset": 0.0, "total": 1000.0, "avg_entry_price": 0.0}
         self.p_state_new = {"cash": 1000.0, "asset": 0.0, "total": 1000.0, "avg_entry_price": 0.0}
+
+        # Visualization
+        self.visualizer = TradingVisualizer(interval=100) # Reset every 100 steps for demo (1000 in prod)
 
         self.running = False
 
@@ -192,18 +196,6 @@ class TradingPipeline:
         buffer_data = self.data_collector.get_buffer()
         if buffer_data is not None and len(buffer_data) > 10:
             feats = buffer_data[:, :Config.STATE_DIM]
-            # Ensure tensors are on Config.DEVICE for training
-            # SDE Warmup uses its own loop but models are on DEVICE.
-            # We need to make sure the data passed to warmup is on DEVICE.
-            # train_sde_warmup logic handles .to(device) internally usually?
-            # Let's check src/utils/training.py
-            # "batch_x = batch_x.to(device)" -> It relies on `device` argument.
-            # We need to pass `Config.DEVICE` to `train_sde_warmup`.
-            # We should modify `train_sde_warmup` signature or call usage.
-            # Let's see existing signature in previous turn.
-            # def train_sde_warmup(sde_model, train_loader, epochs=50, device="cpu"):
-            # It has a device arg.
-
             x = feats[:-1]
             y = feats[1:]
             dt = feats[:-1, -1]
@@ -249,8 +241,6 @@ class TradingPipeline:
                         self.p_state_new, action_new.item(), abs_price, latency, is_real_execution=False
                     )
 
-                    # Store cpu tensors in buffer to save GPU mem? Or keep on GPU?
-                    # Usually replay buffer stores CPU tensors.
                     self.replay_buffer.append((
                         state[0].cpu(), future_dist[0].cpu(), p_vec_new[0].cpu(), action_new[0].cpu(), reward_new, log_prob_new[0].cpu()
                     ))
@@ -260,19 +250,36 @@ class TradingPipeline:
                     self.performance_history["old"].append(reward_old)
                     self.performance_history["new"].append(reward_new)
 
-                    if len(self.performance_history["new"]) % 20 == 0:
-                        print(f"Step: {len(self.performance_history['new'])} | "
-                              f"Price: {abs_price:.2f} | "
-                              f"Wealth Old: {self.p_state_old['total']:.2f} | "
-                              f"Wealth New: {self.p_state_new['total']:.2f} | "
-                              f"Action New: {action_new.item():.2f}")
-
+                    # --- Visualization Update ---
+                    swap_event = False
                     if self.should_replace_model():
                         print(">>> REPLACING MODEL <<<")
                         self.old_model.load_state_dict(self.new_model.state_dict())
                         self.performance_history["old"] = []
                         self.performance_history["new"] = []
                         self.p_state_old = self.p_state_new.copy()
+                        swap_event = True
+
+                    # Update Viz every step
+                    self.visualizer.update({
+                        "wealth_old": self.p_state_old["total"],
+                        "wealth_new": self.p_state_new["total"],
+                        "p_state_new": self.p_state_new,
+                        "action_new": action_new.item(),
+                        "price": abs_price,
+                        "swap_event": swap_event
+                    })
+
+                    # Plot periodically (e.g. every 10 steps to reduce IO)
+                    if len(self.performance_history["new"]) % 10 == 0:
+                         self.visualizer.plot_and_save()
+
+                    if len(self.performance_history["new"]) % 20 == 0:
+                        print(f"Step: {len(self.performance_history['new'])} | "
+                              f"Price: {abs_price:.2f} | "
+                              f"Wealth Old: {self.p_state_old['total']:.2f} | "
+                              f"Wealth New: {self.p_state_new['total']:.2f} | "
+                              f"Action New: {action_new.item():.2f}")
 
                 except Exception as e:
                     print(f"Loop Error: {e}")
