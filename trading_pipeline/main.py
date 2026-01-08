@@ -17,7 +17,7 @@ class TradingPipeline:
     def __init__(self):
         # Validate Config
         Config.validate()
-        print(f"Initializing Pipeline in {Config.MODE} mode...")
+        print(f"Initializing Pipeline in {Config.MODE} mode on {Config.DEVICE}...")
 
         # Dimensions
         self.state_dim = Config.STATE_DIM
@@ -25,10 +25,10 @@ class TradingPipeline:
         self.portfolio_dim = Config.PORTFOLIO_DIM
         self.action_dim = Config.ACTION_DIM
 
-        # Models
-        self.old_model = TradingAgent(self.state_dim, self.action_dim, self.latent_dim, self.portfolio_dim)
-        self.new_model = TradingAgent(self.state_dim, self.action_dim, self.latent_dim, self.portfolio_dim)
-        self.sde_predictor = LatentSDE(input_dim=self.state_dim, latent_dim=self.latent_dim)
+        # Models - Move to Config.DEVICE
+        self.old_model = TradingAgent(self.state_dim, self.action_dim, self.latent_dim, self.portfolio_dim).to(Config.DEVICE)
+        self.new_model = TradingAgent(self.state_dim, self.action_dim, self.latent_dim, self.portfolio_dim).to(Config.DEVICE)
+        self.sde_predictor = LatentSDE(input_dim=self.state_dim, latent_dim=self.latent_dim).to(Config.DEVICE)
 
         self.optimizer = optim.Adam(self.new_model.parameters(), lr=Config.RL_LEARNING_RATE)
 
@@ -48,7 +48,6 @@ class TradingPipeline:
     async def update_portfolio(self, p_state, action_weight, current_price, latency, is_real_execution=False):
         """
         Updates portfolio with Commission and Stop-Loss logic.
-        If is_real_execution is True, it executes orders via data_collector.
         """
         # --- HARD STOP-LOSS CHECK ---
         if p_state["asset"] > 0 and p_state["avg_entry_price"] > 0:
@@ -63,7 +62,6 @@ class TradingPipeline:
 
         diff_value = target_asset_value - current_asset_value
 
-        # Slippage calculation (for simulation/reward)
         slippage_pct = latency * 0.001
         if diff_value > 0:
             sim_exec_price = current_price * (1 + slippage_pct)
@@ -74,23 +72,14 @@ class TradingPipeline:
         commission_cost = 0.0
 
         # Execution Logic
-        if abs(diff_value) > 1.0: # Minimum trade size $1
+        if abs(diff_value) > 1.0:
 
             # Real Execution Order
             if is_real_execution and Config.MODE == 'REAL':
                 side = 'buy' if diff_value > 0 else 'sell'
-                # quantity = abs(diff_value) / current_price # Estimate quantity
-                # Better to use fetched balance? But let's rely on internal state tracking for sync
                 qty_to_trade = abs(diff_value) / current_price
-
-                # Execute Order
-                # We await here since we are in async function now
                 order = await self.data_collector.create_order(side, qty_to_trade)
                 if order:
-                    # Sync state with real execution if possible, or assume fill
-                    # Ideally we fetch balance, but for now we update internal state based on assumed fill
-                    # to keep 'old' and 'new' models consistent in logic.
-                    # Or we could just print:
                     print(f"REAL EXECUTION: {side} {qty_to_trade:.6f} @ ~{current_price}")
 
             # Simulation / State Update Logic
@@ -165,11 +154,12 @@ class TradingPipeline:
 
         states, sde_outs, p_states, actions, rewards, log_probs = zip(*batch)
 
-        states = torch.stack(states)
-        sde_outs = torch.stack(sde_outs)
-        p_states = torch.stack(p_states)
-        actions = torch.stack(actions)
-        rewards = torch.tensor(rewards, dtype=torch.float32).unsqueeze(1)
+        # Stack and Move to Config.DEVICE
+        states = torch.stack(states).to(Config.DEVICE)
+        sde_outs = torch.stack(sde_outs).to(Config.DEVICE)
+        p_states = torch.stack(p_states).to(Config.DEVICE)
+        actions = torch.stack(actions).to(Config.DEVICE)
+        rewards = torch.tensor(rewards, dtype=torch.float32).unsqueeze(1).to(Config.DEVICE)
 
         mean, log_std, value = self.new_model(states, sde_outs, p_states)
         dist = torch.distributions.Normal(mean, log_std.exp())
@@ -192,10 +182,6 @@ class TradingPipeline:
 
     async def run_async(self):
         self.running = True
-
-        # Start Data Collector in Background
-        # We need to run it concurrently.
-        # Ideally, we create a task for collector.connect()
         collector_task = asyncio.create_task(self.data_collector.connect())
 
         print("Waiting for data buffer to fill...")
@@ -206,13 +192,24 @@ class TradingPipeline:
         buffer_data = self.data_collector.get_buffer()
         if buffer_data is not None and len(buffer_data) > 10:
             feats = buffer_data[:, :Config.STATE_DIM]
+            # Ensure tensors are on Config.DEVICE for training
+            # SDE Warmup uses its own loop but models are on DEVICE.
+            # We need to make sure the data passed to warmup is on DEVICE.
+            # train_sde_warmup logic handles .to(device) internally usually?
+            # Let's check src/utils/training.py
+            # "batch_x = batch_x.to(device)" -> It relies on `device` argument.
+            # We need to pass `Config.DEVICE` to `train_sde_warmup`.
+            # We should modify `train_sde_warmup` signature or call usage.
+            # Let's see existing signature in previous turn.
+            # def train_sde_warmup(sde_model, train_loader, epochs=50, device="cpu"):
+            # It has a device arg.
+
             x = feats[:-1]
             y = feats[1:]
             dt = feats[:-1, -1]
             loader = [(x, dt, y)]
             try:
-                # SDE Warmup is CPU bound / synchronous, so we run it directly
-                train_sde_warmup(self.sde_predictor, loader, epochs=Config.SDE_WARMUP_EPOCHS)
+                train_sde_warmup(self.sde_predictor, loader, epochs=Config.SDE_WARMUP_EPOCHS, device=Config.DEVICE)
             except Exception as e:
                 print(f"SDE Warmup Failed: {e}")
 
@@ -227,15 +224,17 @@ class TradingPipeline:
                     state_vec = market_data[:Config.STATE_DIM]
                     latency = state_vec[-1].item()
 
-                    state = state_vec.unsqueeze(0)
+                    # Move state to DEVICE
+                    state = state_vec.unsqueeze(0).to(Config.DEVICE)
 
                     with torch.no_grad():
                         future_dist = self.sde_predictor(state, latency)
 
-                    p_vec_old = torch.tensor([self.p_state_old["cash"], self.p_state_old["asset"]]).float().unsqueeze(0)
-                    p_vec_new = torch.tensor([self.p_state_new["cash"], self.p_state_new["asset"]]).float().unsqueeze(0)
+                    # Portfolio Vector
+                    p_vec_old = torch.tensor([self.p_state_old["cash"], self.p_state_old["asset"]]).float().unsqueeze(0).to(Config.DEVICE)
+                    p_vec_new = torch.tensor([self.p_state_new["cash"], self.p_state_new["asset"]]).float().unsqueeze(0).to(Config.DEVICE)
 
-                    # OLD (Production Model) - Executes Real Trades
+                    # OLD
                     with torch.no_grad():
                         action_old, _, _ = self.old_model.get_action(state, future_dist, p_vec_old, deterministic=True)
 
@@ -243,15 +242,17 @@ class TradingPipeline:
                         self.p_state_old, action_old.item(), abs_price, latency, is_real_execution=True
                     )
 
-                    # NEW (Challenger Model) - Simulation Only
+                    # NEW
                     action_new, log_prob_new, _ = self.new_model.get_action(state, future_dist, p_vec_new, deterministic=False)
 
                     reward_new, self.p_state_new = await self.update_portfolio(
                         self.p_state_new, action_new.item(), abs_price, latency, is_real_execution=False
                     )
 
+                    # Store cpu tensors in buffer to save GPU mem? Or keep on GPU?
+                    # Usually replay buffer stores CPU tensors.
                     self.replay_buffer.append((
-                        state[0], future_dist[0], p_vec_new[0], action_new[0], reward_new, log_prob_new[0]
+                        state[0].cpu(), future_dist[0].cpu(), p_vec_new[0].cpu(), action_new[0].cpu(), reward_new, log_prob_new[0].cpu()
                     ))
 
                     self.train_step_rl()
@@ -275,7 +276,7 @@ class TradingPipeline:
 
                 except Exception as e:
                     print(f"Loop Error: {e}")
-                    traceback.print_exc()
+                    # traceback.print_exc()
 
                 await asyncio.sleep(0.1)
 
@@ -288,7 +289,6 @@ class TradingPipeline:
 
 if __name__ == "__main__":
     pipeline = TradingPipeline()
-    # Run Async Loop
     try:
         asyncio.run(pipeline.run_async())
     except KeyboardInterrupt:
