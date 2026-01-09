@@ -41,7 +41,6 @@ class TradingPipeline:
         self.training_batch_size = Config.RL_BATCH_SIZE
 
         # State Tracking
-        # Added 'gross_total' to track wealth without fees
         self.p_state_old = {"cash": 1000.0, "asset": 0.0, "total": 1000.0, "avg_entry_price": 0.0}
         self.p_state_new = {"cash": 1000.0, "asset": 0.0, "total": 1000.0, "avg_entry_price": 0.0, "gross_total": 1000.0}
 
@@ -62,16 +61,6 @@ class TradingPipeline:
                 action_weight = 0.0 # Force Sell
 
         prev_total = p_state["cash"] + p_state["asset"] * current_price
-
-        # Gross tracking (Theoretical performance if no costs)
-        # We need to simulate a parallel "Gross" state?
-        # Simpler: Gross Wealth = Net Wealth + Cumulative Fees Paid?
-        # Or just track raw PnL?
-        # Let's approximate Gross by adding back commission cost this step to current Total.
-        # But Slippage is also a cost.
-        # Ideally, we maintain a separate `gross_total` variable that evolves without fees.
-        # But rebalancing logic depends on current assets.
-        # Let's just track `commission_cost` this step and Visualizer accumulates it to show Gross = Net + Cum_Comm.
 
         target_asset_value = prev_total * action_weight
         current_asset_value = p_state["asset"] * current_price
@@ -163,15 +152,11 @@ class TradingPipeline:
         reward = calculate_reward(prev_total, new_total, total_cost, volatility=0.0)
         p_state["total"] = new_total
 
-        # Calculate Gross Wealth (Approx)
-        # p_state["gross_total"] = new_total + accumulated commissions logic handles in visualizer better
-        # We just return commission_cost
-
         return reward, p_state, commission_cost, trade_type
 
     def train_step_rl(self):
         if len(self.replay_buffer) < self.training_batch_size:
-            return
+            return 0.0, 0.0
 
         batch = self.replay_buffer[:self.training_batch_size]
         self.replay_buffer = self.replay_buffer[self.training_batch_size:]
@@ -197,6 +182,8 @@ class TradingPipeline:
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+
+        return actor_loss.item(), critic_loss.item()
 
     def should_replace_model(self):
         if len(self.performance_history["new"]) < 100: return False
@@ -227,7 +214,6 @@ class TradingPipeline:
 
         print("Starting Trading Loop...")
 
-        # Track gross wealth separately in loop for visualization consistency
         cum_comm_new = 0.0
 
         try:
@@ -242,8 +228,26 @@ class TradingPipeline:
                     # Move state to DEVICE
                     state = state_vec.unsqueeze(0).to(Config.DEVICE)
 
+                    # SDE Prediction & Reconstruction Error Check
                     with torch.no_grad():
-                        future_dist = self.sde_predictor(state, latency)
+                        future_latent, future_decoded = self.sde_predictor(state, latency, decode=True)
+                        # We compare 'future_decoded' against... what?
+                        # Ideally, against the REAL next state.
+                        # But we only have current state.
+                        # We can compare `decoder(encoder(state))` vs `state` (AE reconstruction error)
+                        # OR `future_decoded` vs `next_state` in the NEXT loop.
+                        # For "live_sde.png" checking if SDE predicts well:
+                        # We need to buffer predictions.
+                        # Simple metric: Autoencoder reconstruction loss of CURRENT state.
+                        # If SDE (Latent) preserves info, decoding latent should be close to state.
+                        # However, SDE predicts *future*.
+                        # Let's calculate AE Reconstruction Loss as a proxy for "Model Understanding".
+                        # z0 = encoder(state), x_recon = decoder(z0).
+                        z0 = self.sde_predictor.encoder(state)
+                        state_recon = self.sde_predictor.decoder(z0)
+                        sde_loss = nn.MSELoss()(state_recon, state).item()
+
+                        future_dist = future_latent # Pass latent to RL
 
                     # Portfolio Vector
                     p_vec_old = torch.tensor([self.p_state_old["cash"], self.p_state_old["asset"]]).float().unsqueeze(0).to(Config.DEVICE)
@@ -253,7 +257,6 @@ class TradingPipeline:
                     with torch.no_grad():
                         action_old, _, _ = self.old_model.get_action(state, future_dist, p_vec_old, deterministic=True)
 
-                    # Note: We ignore commission/trade_type for old model viz for simplicity, focusing on New model analysis
                     reward_old, self.p_state_old, _, _ = await self.update_portfolio(
                         self.p_state_old, action_old.item(), abs_price, latency, is_real_execution=True
                     )
@@ -272,7 +275,7 @@ class TradingPipeline:
                         state[0].cpu(), future_dist[0].cpu(), p_vec_new[0].cpu(), action_new[0].cpu(), reward_new, log_prob_new[0].cpu()
                     ))
 
-                    self.train_step_rl()
+                    actor_loss, critic_loss = self.train_step_rl()
 
                     self.performance_history["old"].append(reward_old)
                     self.performance_history["new"].append(reward_new)
@@ -296,16 +299,20 @@ class TradingPipeline:
                         "price": abs_price,
                         "swap_event": swap_event,
                         "commission_step": comm_new,
-                        "trade_type": trade_type_new
+                        "trade_type": trade_type_new,
+                        # Extra fields for new plots
+                        "sde_loss": sde_loss,
+                        "actor_loss": actor_loss,
+                        "critic_loss": critic_loss,
+                        "reward": reward_new
                     })
 
-                    # Plot every 100 steps (I/O optimization)
+                    # Plot every 100 steps
                     if len(self.performance_history["new"]) % 100 == 0:
-                         self.visualizer.plot_and_save()
+                         self.visualizer.plot_all()
                          print(f"Step: {len(self.performance_history['new'])} | "
                                f"Price: {abs_price:.2f} | "
-                               f"Net Wealth: {self.p_state_new['total']:.2f} | "
-                               f"Gross Wealth: {gross_wealth_new:.2f}")
+                               f"Net Wealth: {self.p_state_new['total']:.2f}")
 
                 except Exception as e:
                     print(f"Loop Error: {e}")

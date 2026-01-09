@@ -10,8 +10,13 @@ class LatentSDE(nn.Module):
         self.noise_type = noise_type
 
         self.latent_dim = latent_dim
-        # Encoder
+        self.input_dim = input_dim
+
+        # Encoder: Data -> Latent
         self.encoder = nn.Linear(input_dim, latent_dim)
+
+        # Decoder: Latent -> Data (For visualization and reconstruction loss)
+        self.decoder = nn.Linear(latent_dim, input_dim)
 
         self.theta = nn.Parameter(torch.tensor(0.1))
 
@@ -37,7 +42,7 @@ class LatentSDE(nn.Module):
     def g(self, t, y): # Diffusion function
         return torch.sigmoid(self.sigma_net(y))
 
-    def forward(self, x, delta_t):
+    def forward(self, x, delta_t, decode=False):
         batch_size = x.shape[0] if x.ndim > 1 else 1
         device = x.device
 
@@ -57,4 +62,8 @@ class LatentSDE(nn.Module):
 
         # Explicitly pass dt as step size
         z_t = torchsde.sdeint(self, z0, ts, method='euler', dt=dt)[1]
+
+        if decode:
+            return z_t, self.decoder(z_t)
+
         return z_t
