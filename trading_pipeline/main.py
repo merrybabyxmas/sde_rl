@@ -41,17 +41,19 @@ class TradingPipeline:
         self.training_batch_size = Config.RL_BATCH_SIZE
 
         # State Tracking
+        # Added 'gross_total' to track wealth without fees
         self.p_state_old = {"cash": 1000.0, "asset": 0.0, "total": 1000.0, "avg_entry_price": 0.0}
-        self.p_state_new = {"cash": 1000.0, "asset": 0.0, "total": 1000.0, "avg_entry_price": 0.0}
+        self.p_state_new = {"cash": 1000.0, "asset": 0.0, "total": 1000.0, "avg_entry_price": 0.0, "gross_total": 1000.0}
 
         # Visualization
-        self.visualizer = TradingVisualizer(interval=100) # Reset every 100 steps for demo (1000 in prod)
+        self.visualizer = TradingVisualizer(mode=Config.MODE)
 
         self.running = False
 
     async def update_portfolio(self, p_state, action_weight, current_price, latency, is_real_execution=False):
         """
         Updates portfolio with Commission and Stop-Loss logic.
+        Returns: reward, p_state, step_commission, trade_type
         """
         # --- HARD STOP-LOSS CHECK ---
         if p_state["asset"] > 0 and p_state["avg_entry_price"] > 0:
@@ -60,6 +62,16 @@ class TradingPipeline:
                 action_weight = 0.0 # Force Sell
 
         prev_total = p_state["cash"] + p_state["asset"] * current_price
+
+        # Gross tracking (Theoretical performance if no costs)
+        # We need to simulate a parallel "Gross" state?
+        # Simpler: Gross Wealth = Net Wealth + Cumulative Fees Paid?
+        # Or just track raw PnL?
+        # Let's approximate Gross by adding back commission cost this step to current Total.
+        # But Slippage is also a cost.
+        # Ideally, we maintain a separate `gross_total` variable that evolves without fees.
+        # But rebalancing logic depends on current assets.
+        # Let's just track `commission_cost` this step and Visualizer accumulates it to show Gross = Net + Cum_Comm.
 
         target_asset_value = prev_total * action_weight
         current_asset_value = p_state["asset"] * current_price
@@ -74,6 +86,7 @@ class TradingPipeline:
 
         slippage_cost = 0.0
         commission_cost = 0.0
+        trade_type = None
 
         # Execution Logic
         if abs(diff_value) > 1.0:
@@ -88,6 +101,7 @@ class TradingPipeline:
 
             # Simulation / State Update Logic
             if diff_value > 0: # Buy
+                trade_type = 'buy'
                 amount_to_buy = diff_value / sim_exec_price
                 cost = amount_to_buy * sim_exec_price
 
@@ -119,6 +133,7 @@ class TradingPipeline:
                     slippage_cost = (sim_exec_price - current_price) * amount_to_buy
 
             else: # Sell
+                trade_type = 'sell'
                 amount_to_sell = abs(diff_value) / sim_exec_price
 
                 if p_state["asset"] >= amount_to_sell:
@@ -147,7 +162,12 @@ class TradingPipeline:
 
         reward = calculate_reward(prev_total, new_total, total_cost, volatility=0.0)
         p_state["total"] = new_total
-        return reward, p_state
+
+        # Calculate Gross Wealth (Approx)
+        # p_state["gross_total"] = new_total + accumulated commissions logic handles in visualizer better
+        # We just return commission_cost
+
+        return reward, p_state, commission_cost, trade_type
 
     def train_step_rl(self):
         if len(self.replay_buffer) < self.training_batch_size:
@@ -207,6 +227,9 @@ class TradingPipeline:
 
         print("Starting Trading Loop...")
 
+        # Track gross wealth separately in loop for visualization consistency
+        cum_comm_new = 0.0
+
         try:
             while self.running:
                 try:
@@ -230,16 +253,20 @@ class TradingPipeline:
                     with torch.no_grad():
                         action_old, _, _ = self.old_model.get_action(state, future_dist, p_vec_old, deterministic=True)
 
-                    reward_old, self.p_state_old = await self.update_portfolio(
+                    # Note: We ignore commission/trade_type for old model viz for simplicity, focusing on New model analysis
+                    reward_old, self.p_state_old, _, _ = await self.update_portfolio(
                         self.p_state_old, action_old.item(), abs_price, latency, is_real_execution=True
                     )
 
                     # NEW
                     action_new, log_prob_new, _ = self.new_model.get_action(state, future_dist, p_vec_new, deterministic=False)
 
-                    reward_new, self.p_state_new = await self.update_portfolio(
+                    reward_new, self.p_state_new, comm_new, trade_type_new = await self.update_portfolio(
                         self.p_state_new, action_new.item(), abs_price, latency, is_real_execution=False
                     )
+
+                    cum_comm_new += comm_new
+                    gross_wealth_new = self.p_state_new["total"] + cum_comm_new
 
                     self.replay_buffer.append((
                         state[0].cpu(), future_dist[0].cpu(), p_vec_new[0].cpu(), action_new[0].cpu(), reward_new, log_prob_new[0].cpu()
@@ -260,30 +287,29 @@ class TradingPipeline:
                         self.p_state_old = self.p_state_new.copy()
                         swap_event = True
 
-                    # Update Viz every step
                     self.visualizer.update({
-                        "wealth_old": self.p_state_old["total"],
-                        "wealth_new": self.p_state_new["total"],
+                        "wealth_net_old": self.p_state_old["total"],
+                        "wealth_net_new": self.p_state_new["total"],
+                        "wealth_gross_new": gross_wealth_new,
                         "p_state_new": self.p_state_new,
                         "action_new": action_new.item(),
                         "price": abs_price,
-                        "swap_event": swap_event
+                        "swap_event": swap_event,
+                        "commission_step": comm_new,
+                        "trade_type": trade_type_new
                     })
 
-                    # Plot periodically (e.g. every 10 steps to reduce IO)
-                    if len(self.performance_history["new"]) % 10 == 0:
+                    # Plot every 100 steps (I/O optimization)
+                    if len(self.performance_history["new"]) % 100 == 0:
                          self.visualizer.plot_and_save()
-
-                    if len(self.performance_history["new"]) % 20 == 0:
-                        print(f"Step: {len(self.performance_history['new'])} | "
-                              f"Price: {abs_price:.2f} | "
-                              f"Wealth Old: {self.p_state_old['total']:.2f} | "
-                              f"Wealth New: {self.p_state_new['total']:.2f} | "
-                              f"Action New: {action_new.item():.2f}")
+                         print(f"Step: {len(self.performance_history['new'])} | "
+                               f"Price: {abs_price:.2f} | "
+                               f"Net Wealth: {self.p_state_new['total']:.2f} | "
+                               f"Gross Wealth: {gross_wealth_new:.2f}")
 
                 except Exception as e:
                     print(f"Loop Error: {e}")
-                    # traceback.print_exc()
+                    traceback.print_exc()
 
                 await asyncio.sleep(0.1)
 

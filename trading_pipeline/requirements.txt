@@ -4,3 +4,5 @@ pandas
 websockets
 numpy
 ccxt
+matplotlib
+seaborn
