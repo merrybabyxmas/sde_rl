@@ -3,6 +3,60 @@ import torch.nn as nn
 from torch.distributions import Normal
 from config.settings import Config
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SACActor(nn.Module):
+    def __init__(self, state_dim, action_dim, latent_dim, portfolio_dim):
+        super().__init__()
+        # SDE 잠재 벡터와 상태, 포트폴리오를 결합하여 입력
+        input_size = state_dim + latent_dim + portfolio_dim
+        hidden_dims = [256, 256]
+        
+        self.net = nn.Sequential(
+            nn.Linear(input_size, hidden_dims[0]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[0], hidden_dims[1]),
+            nn.ReLU()
+        )
+        self.mu = nn.Linear(hidden_dims[1], action_dim)
+        self.log_std = nn.Linear(hidden_dims[1], action_dim)
+
+    def forward(self, state, sde_latent, p_vec):
+        x = torch.cat([state, sde_latent, p_vec], dim=-1)
+        x = self.net(x)
+        mu = self.mu(x)
+        log_std = torch.clamp(self.log_std(x), -20, 2) # 안정성을 위해 클램핑
+        return mu, log_std
+
+    def sample(self, state, sde_latent, p_vec):
+        mu, log_std = self.forward(state, sde_latent, p_vec)
+        std = log_std.exp()
+        dist = torch.distributions.Normal(mu, std)
+        z = dist.rsample() # Reparameterization trick
+        action = torch.sigmoid(z) # 0~1 사이 비중으로 변환
+        log_prob = dist.log_prob(z) - torch.log(action * (1 - action) + 1e-6) # Jacobian 보정
+        return action, log_prob.sum(-1, keepdim=True)
+
+class SACCritic(nn.Module):
+    def __init__(self, state_dim, action_dim, latent_dim, portfolio_dim):
+        super().__init__()
+        input_size = state_dim + latent_dim + portfolio_dim + action_dim
+        self.q_net = nn.Sequential(
+            nn.Linear(input_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+
+    def forward(self, state, sde_latent, p_vec, action):
+        x = torch.cat([state, sde_latent, p_vec, action], dim=-1)
+        return self.q_net(x)
+
+
+
 class TradingAgent(nn.Module):
     def __init__(self, state_dim, action_dim=1, sde_dim=8, portfolio_dim=2):
         super().__init__()
