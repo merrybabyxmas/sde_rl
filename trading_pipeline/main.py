@@ -11,7 +11,7 @@ from src.models.sde_model import LatentSDE
 from src.models.rl_agent import TradingAgent
 from src.data.collector import RealTimeDataCollector
 from src.strategy.reward import calculate_reward
-from src.utils.training import train_sde_warmup
+# from src.utils.training import train_sde_warmup # Deprecated
 from src.utils.visualizer import TradingVisualizer
 
 class TradingPipeline:
@@ -31,7 +31,10 @@ class TradingPipeline:
         self.new_model = TradingAgent(self.state_dim, self.action_dim, self.latent_dim, self.portfolio_dim).to(Config.DEVICE)
         self.sde_predictor = LatentSDE(input_dim=self.state_dim, latent_dim=self.latent_dim).to(Config.DEVICE)
 
-        self.optimizer = optim.Adam(self.new_model.parameters(), lr=Config.RL_LEARNING_RATE)
+        # Optimizers
+        self.rl_optimizer = optim.Adam(self.new_model.parameters(), lr=Config.RL_LEARNING_RATE)
+        self.sde_optimizer = optim.Adam(self.sde_predictor.parameters(), lr=1e-3) # Separate SDE Optimizer
+        self.sde_criterion = nn.MSELoss()
 
         # Data Collector
         self.data_collector = RealTimeDataCollector(mode=Config.MODE)
@@ -48,11 +51,11 @@ class TradingPipeline:
         self.visualizer = TradingVisualizer(mode=Config.MODE)
 
         self.running = False
+        self.sde_loss_history = [] # For thread-safe tracking
 
     async def update_portfolio(self, p_state, action_weight, current_price, latency, is_real_execution=False):
         """
         Updates portfolio with Commission and Stop-Loss logic.
-        Returns: reward, p_state, step_commission, trade_type
         """
         # --- HARD STOP-LOSS CHECK ---
         if p_state["asset"] > 0 and p_state["avg_entry_price"] > 0:
@@ -79,8 +82,6 @@ class TradingPipeline:
 
         # Execution Logic
         if abs(diff_value) > 1.0:
-
-            # Real Execution Order
             if is_real_execution and Config.MODE == 'REAL':
                 side = 'buy' if diff_value > 0 else 'sell'
                 qty_to_trade = abs(diff_value) / current_price
@@ -99,22 +100,18 @@ class TradingPipeline:
                     fee_amount = amount_to_buy * Config.COMMISSION_RATE
                     net_amount = amount_to_buy - fee_amount
                     commission_cost = fee_amount * sim_exec_price
-
                     total_qty = p_state["asset"] + net_amount
                     if total_qty > 0:
                         p_state["avg_entry_price"] = (p_state["asset"] * p_state["avg_entry_price"] + net_amount * sim_exec_price) / total_qty
                     p_state["asset"] += net_amount
                     slippage_cost = (sim_exec_price - current_price) * amount_to_buy
-
                 else:
                     cost = p_state["cash"]
                     amount_to_buy = cost / sim_exec_price
                     p_state["cash"] = 0.0
-
                     fee_amount = amount_to_buy * Config.COMMISSION_RATE
                     net_amount = amount_to_buy - fee_amount
                     commission_cost = fee_amount * sim_exec_price
-
                     total_qty = p_state["asset"] + net_amount
                     if total_qty > 0:
                         p_state["avg_entry_price"] = (p_state["asset"] * p_state["avg_entry_price"] + net_amount * sim_exec_price) / total_qty
@@ -137,12 +134,10 @@ class TradingPipeline:
                     amount_to_sell = p_state["asset"]
                     p_state["asset"] = 0.0
                     p_state["avg_entry_price"] = 0.0
-
                     proceeds = amount_to_sell * sim_exec_price
                     fee_val = proceeds * Config.COMMISSION_RATE
                     net_proceeds = proceeds - fee_val
                     commission_cost = fee_val
-
                     p_state["cash"] += net_proceeds
                     slippage_cost = (current_price - sim_exec_price) * amount_to_sell
 
@@ -163,7 +158,6 @@ class TradingPipeline:
 
         states, sde_outs, p_states, actions, rewards, log_probs = zip(*batch)
 
-        # Stack and Move to Config.DEVICE
         states = torch.stack(states).to(Config.DEVICE)
         sde_outs = torch.stack(sde_outs).to(Config.DEVICE)
         p_states = torch.stack(p_states).to(Config.DEVICE)
@@ -179,11 +173,71 @@ class TradingPipeline:
         critic_loss = nn.MSELoss()(value, rewards)
         loss = actor_loss + 0.5 * critic_loss
 
-        self.optimizer.zero_grad()
+        self.rl_optimizer.zero_grad()
         loss.backward()
-        self.optimizer.step()
+        self.rl_optimizer.step()
 
         return actor_loss.item(), critic_loss.item()
+
+    def train_sde_step(self, x, dt, y):
+        """
+        Single step of SDE training on batch.
+        x: Current State [batch, dim]
+        dt: Latency [batch] or scalar
+        y: Target State (Next) [batch, dim]
+        """
+        self.sde_optimizer.zero_grad()
+
+        if isinstance(dt, torch.Tensor) and dt.ndim > 0:
+            dt_scalar = dt.mean().item() # Approx for batch
+        else:
+            dt_scalar = dt
+
+        # SDE Prediction (Forward) + Decoder
+        _, pred_decoded = self.sde_predictor(x, dt_scalar, decode=True)
+
+        # Loss: Reconstruction of Future State
+        loss = self.sde_criterion(pred_decoded, y)
+        loss.backward()
+        self.sde_optimizer.step()
+
+        return loss.item()
+
+    async def sde_update_loop(self):
+        """Background task to continuously train SDE"""
+        print("SDE Async Update Loop Started...")
+        while self.running:
+            try:
+                # Pull latest data from buffer
+                # Buffer shape: [T, 22]
+                buffer_data = self.data_collector.get_buffer()
+
+                # Check sufficient data for a batch
+                if buffer_data is not None and len(buffer_data) > 64:
+                    # Sample a random batch or take recent?
+                    # Sequential recent is better for SDE path properties?
+                    # SDE is Markovian here (x->y given dt). Random batch is fine.
+                    # Let's take random batch of size 32 from recent history
+                    indices = torch.randint(0, len(buffer_data)-1, (32,))
+
+                    batch = buffer_data[indices] # [32, 22]
+                    next_batch = buffer_data[indices + 1]
+
+                    x = batch[:, :Config.STATE_DIM].to(Config.DEVICE)
+                    dt = batch[:, Config.STATE_DIM-1] # Latency is last feat of state dim
+                    # Actually latency is at index 20 (STATE_DIM=21).
+                    # dt = batch[:, 20].to(Config.DEVICE)
+                    # Next state target
+                    y = next_batch[:, :Config.STATE_DIM].to(Config.DEVICE)
+
+                    loss = self.train_sde_step(x, dt, y)
+                    self.sde_loss_history.append(loss)
+
+            except Exception as e:
+                # print(f"SDE Update Error: {e}")
+                pass
+
+            await asyncio.sleep(1.0) # Train SDE every 1s
 
     def should_replace_model(self):
         if len(self.performance_history["new"]) < 100: return False
@@ -195,24 +249,30 @@ class TradingPipeline:
         self.running = True
         collector_task = asyncio.create_task(self.data_collector.connect())
 
-        print("Waiting for data buffer to fill...")
-        while len(self.data_collector.buffer) < 50:
+        print("Waiting for initial data buffer (Phase 1)...")
+        # Phase 1: Wait for 500 points
+        while len(self.data_collector.buffer) < 500:
             await asyncio.sleep(0.1)
 
-        print("Starting SDE Warm-up...")
-        buffer_data = self.data_collector.get_buffer()
-        if buffer_data is not None and len(buffer_data) > 10:
-            feats = buffer_data[:, :Config.STATE_DIM]
+        print(f"Buffer filled ({len(self.data_collector.buffer)}). Starting SDE Pre-training (Phase 1)...")
+
+        # SDE Pre-training Loop (Synchronous blocking here to ensure quality before RL)
+        for i in range(50): # 50 'Epochs' or steps
+            buffer_data = self.data_collector.get_buffer()
+            # Full batch or sliding? Let's do simple sliding batch over buffer
+            feats = buffer_data[:, :Config.STATE_DIM].to(Config.DEVICE)
             x = feats[:-1]
             y = feats[1:]
-            dt = feats[:-1, -1]
-            loader = [(x, dt, y)]
-            try:
-                train_sde_warmup(self.sde_predictor, loader, epochs=Config.SDE_WARMUP_EPOCHS, device=Config.DEVICE)
-            except Exception as e:
-                print(f"SDE Warmup Failed: {e}")
+            dt = feats[:-1, -1] # Latency
 
-        print("Starting Trading Loop...")
+            loss = self.train_sde_step(x, dt, y)
+            if i % 10 == 0:
+                print(f"SDE Pre-train Step {i}: Loss {loss:.6f}")
+
+        print("SDE Pre-training Complete. Starting RL & Async SDE Update (Phase 2)...")
+
+        # Start SDE Async Updater
+        sde_task = asyncio.create_task(self.sde_update_loop())
 
         cum_comm_new = 0.0
 
@@ -225,29 +285,19 @@ class TradingPipeline:
                     state_vec = market_data[:Config.STATE_DIM]
                     latency = state_vec[-1].item()
 
-                    # Move state to DEVICE
                     state = state_vec.unsqueeze(0).to(Config.DEVICE)
 
-                    # SDE Prediction & Reconstruction Error Check
+                    # SDE Prediction
                     with torch.no_grad():
                         future_latent, future_decoded = self.sde_predictor(state, latency, decode=True)
-                        # We compare 'future_decoded' against... what?
-                        # Ideally, against the REAL next state.
-                        # But we only have current state.
-                        # We can compare `decoder(encoder(state))` vs `state` (AE reconstruction error)
-                        # OR `future_decoded` vs `next_state` in the NEXT loop.
-                        # For "live_sde.png" checking if SDE predicts well:
-                        # We need to buffer predictions.
-                        # Simple metric: Autoencoder reconstruction loss of CURRENT state.
-                        # If SDE (Latent) preserves info, decoding latent should be close to state.
-                        # However, SDE predicts *future*.
-                        # Let's calculate AE Reconstruction Loss as a proxy for "Model Understanding".
-                        # z0 = encoder(state), x_recon = decoder(z0).
-                        z0 = self.sde_predictor.encoder(state)
-                        state_recon = self.sde_predictor.decoder(z0)
-                        sde_loss = nn.MSELoss()(state_recon, state).item()
+                        future_dist = future_latent
 
-                        future_dist = future_latent # Pass latent to RL
+                    # SDE Loss for Visualization (Current Step Recon)
+                    # We can use the latest loss from the async loop history if available
+                    if self.sde_loss_history:
+                        sde_loss_viz = self.sde_loss_history[-1]
+                    else:
+                        sde_loss_viz = 0.0
 
                     # Portfolio Vector
                     p_vec_old = torch.tensor([self.p_state_old["cash"], self.p_state_old["asset"]]).float().unsqueeze(0).to(Config.DEVICE)
@@ -280,7 +330,7 @@ class TradingPipeline:
                     self.performance_history["old"].append(reward_old)
                     self.performance_history["new"].append(reward_new)
 
-                    # --- Visualization Update ---
+                    # --- Visualization ---
                     swap_event = False
                     if self.should_replace_model():
                         print(">>> REPLACING MODEL <<<")
@@ -300,14 +350,12 @@ class TradingPipeline:
                         "swap_event": swap_event,
                         "commission_step": comm_new,
                         "trade_type": trade_type_new,
-                        # Extra fields for new plots
-                        "sde_loss": sde_loss,
+                        "sde_loss": sde_loss_viz, # From async loop
                         "actor_loss": actor_loss,
                         "critic_loss": critic_loss,
                         "reward": reward_new
                     })
 
-                    # Plot every 100 steps
                     if len(self.performance_history["new"]) % 100 == 0:
                          self.visualizer.plot_all()
                          print(f"Step: {len(self.performance_history['new'])} | "
