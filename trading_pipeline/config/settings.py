@@ -16,7 +16,7 @@ class Config:
 
     # SDE Network Settings
     LATENT_DIM = 8
-    SDE_HIDDEN_DIM = 64 # Width of internal Drift/Diffusion nets
+    SDE_HIDDEN_DIM = 128 # Width of internal Drift/Diffusion nets
 
     # --- Device Settings ---
     CUDA_INDEX = int(os.getenv('CUDA_INDEX', '0'))
@@ -34,7 +34,7 @@ class Config:
     SDE_WARMUP_EPOCHS = 5
     RL_LEARNING_RATE = 1e-4
     RL_BATCH_SIZE = 20
-    REPLAY_BUFFER_SIZE = 2000
+    REPLAY_BUFFER_SIZE = 30
 
     # RL Algo (PPO/PG)
     GAMMA = 0.99
@@ -51,6 +51,13 @@ class Config:
 
     # Data
     LOOKBACK_WINDOW = 100
+
+
+    # config/settings.py 에 추가
+    OFFLINE_DATA_SIZE = 30      # 오프라인 학습을 위해 기다릴 최소 데이터 양
+    OFFLINE_SDE_EPOCHS = 1      # SDE 오프라인 학습 횟수
+    OFFLINE_RL_EPOCHS = 1        # RL 오프라인 학습 횟수
+
 
     @classmethod
     def validate(cls):
