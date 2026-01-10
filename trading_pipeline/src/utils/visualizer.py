@@ -5,7 +5,6 @@ import os
 import time
 import numpy as np
 
-# Headless 환경 대응
 plt.switch_backend('Agg')
 sns.set_theme(style="darkgrid")
 
@@ -15,10 +14,11 @@ class TradingVisualizer:
         self.save_dir = save_dir
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
+
         self.reset()
 
     def reset(self):
-        # 전체 세션 누적 데이터 (WandB 스타일)
+        # Persistent storage
         self.data = {
             "step": [],
             "wealth_net_old": [],
@@ -27,10 +27,18 @@ class TradingVisualizer:
             "price": [],
             "action_new": [],
             "trade_events": [],
+
+            # Detailed Portfolio
             "cash_new": [],
             "asset_val_new": [],
-            "sde_loss": [],
+
+            # SDE
+            "sde_pred_price": [], # Top-1 Bid Price Prediction
+            "sde_error": [],
+
+            # RL
             "actor_loss": [],
+            "critic_loss": [],
             "reward": []
         }
         self.metrics = {
@@ -46,110 +54,190 @@ class TradingVisualizer:
 
     def update(self, step_data):
         self.step_counter += 1
+
+        # Unpack
         self.data["step"].append(self.step_counter)
-        
-        # 수익 데이터 (Net vs Gross)
-        wealth_net = step_data["wealth_net_new"]
         self.data["wealth_net_old"].append(step_data["wealth_net_old"])
-        self.data["wealth_net_new"].append(wealth_net)
-        self.data["wealth_gross_new"].append(step_data.get("wealth_gross_new", wealth_net))
-        
+        wealth_new = step_data["wealth_net_new"]
+        self.data["wealth_net_new"].append(wealth_new)
+        self.data["wealth_gross_new"].append(step_data.get("wealth_gross_new", wealth_new))
         self.data["price"].append(step_data["price"])
         self.data["action_new"].append(step_data["action_new"])
 
-        # 포트폴리오 세부
+        # Portfolio Details
         p_state = step_data["p_state_new"]
         self.data["cash_new"].append(p_state["cash"])
         self.data["asset_val_new"].append(p_state["asset"] * step_data["price"])
 
-        # 학습 지표 (SDE & RL)
-        self.data["sde_loss"].append(step_data.get("sde_loss", 0.0))
+        # SDE
+        # We assume step_data["sde_pred"] is the decoded tensor (21 dims)
+        # Price is normalized. We just plot the first dim (Bid0) or Error.
+        sde_pred = step_data.get("sde_pred_decoded", None)
+        if sde_pred is not None:
+            # Reconstruct absolute price from normalized
+            # Norm = (P - Mid)/Mid * 100
+            # P = Norm/100 * Mid + Mid
+            # Use current mid price as reference? Or prev?
+            # Prediction was made at t-1 for t. Reference was Mid(t-1).
+            # This is tricky without storing Mid(t-1).
+            # Let's just track the MSE error passed from main loop if available,
+            # or just plot the raw normalized value vs current normalized value.
+            # Let's assume main.py passes `sde_loss_item` directly.
+            self.data["sde_error"].append(step_data.get("sde_loss", 0.0))
+        else:
+            self.data["sde_error"].append(0.0)
+
+        # RL
         self.data["actor_loss"].append(step_data.get("actor_loss", 0.0))
+        self.data["critic_loss"].append(step_data.get("critic_loss", 0.0))
         self.data["reward"].append(step_data.get("reward", 0.0))
 
-        # KPI 계산
+        # Metrics (Commission, MDD, Win Rate)
         comm = step_data.get("commission_step", 0.0)
         self.metrics["cum_commission"] += comm
-        
-        if wealth_net > self.metrics["max_wealth"]:
-            self.metrics["max_wealth"] = wealth_net
-        dd = (self.metrics["max_wealth"] - wealth_net) / self.metrics["max_wealth"]
-        if dd > self.metrics["mdd"]: self.metrics["mdd"] = dd
+
+        if wealth_new > self.metrics["max_wealth"]:
+            self.metrics["max_wealth"] = wealth_new
+        drawdown = (self.metrics["max_wealth"] - wealth_new) / self.metrics["max_wealth"]
+        if drawdown > self.metrics["mdd"]:
+            self.metrics["mdd"] = drawdown
 
         if len(self.data["wealth_net_new"]) > 1:
             prev = self.data["wealth_net_new"][-2]
-            if wealth_net > prev: self.metrics["wins"] += 1
-            elif wealth_net < prev: self.metrics["losses"] += 1
+            if wealth_new > prev: self.metrics["wins"] += 1
+            elif wealth_new < prev: self.metrics["losses"] += 1
 
-        # 거래 이벤트 마커
         t_type = step_data.get("trade_type")
         if t_type:
             self.data["trade_events"].append({
-                "step": self.step_counter, "type": t_type, "price": step_data["price"]
+                "step": self.step_counter,
+                "type": t_type,
+                "price": step_data["price"]
             })
 
         if step_data.get("swap_event", False):
             self.swaps.append(self.step_counter)
 
     def plot_all(self):
-        """WandB 스타일의 통합 대시보드 생성 (live_dashboard.png 고정)"""
         if len(self.data["step"]) < 2: return
-        
+
+        # Generate all plots
+        self.plot_dashboard() # Main
+        self.plot_portfolio()
+        self.plot_sde()
+        self.plot_rl()
+
+    def plot_dashboard(self):
         steps = np.array(self.data["step"])
         w_net = np.array(self.data["wealth_net_new"])
         w_gross = np.array(self.data["wealth_gross_new"])
         prices = np.array(self.data["price"])
 
-        fig = plt.figure(figsize=(15, 18))
-        gs = fig.add_gridspec(4, 1, height_ratios=[2, 2, 1, 1])
+        fig = plt.figure(figsize=(14, 10))
+        gs = fig.add_gridspec(3, 1, height_ratios=[2, 2, 1])
 
-        # 1. 자산 추이 (Net vs Gross)
+        # 1. Wealth
         ax1 = fig.add_subplot(gs[0])
-        ax1.plot(steps, w_gross, label="Gross Wealth (No Fee)", color="green", alpha=0.3)
-        ax1.plot(steps, w_net, label="Net Wealth (Actual)", color="blue", linewidth=2)
-        ax1.plot(steps, self.data["wealth_net_old"], label="Old Model", color="gray", alpha=0.5, linestyle="--")
-        
+        ax1.plot(steps, self.data["wealth_net_old"], label="Old Model (Net)", color="gray", alpha=0.5, linestyle="--")
+        ax1.plot(steps, w_gross, label="New (Gross)", color="green", alpha=0.4)
+        ax1.plot(steps, w_net, label="New (Net)", color="blue", linewidth=2)
+
         for swap in self.swaps:
-            ax1.axvline(x=swap, color='red', linestyle=':', label='Model Swap' if swap == self.swaps[0] else "")
-        
-        roi = (w_net[-1] - self.start_wealth) / self.start_wealth * 100
-        wr = (self.metrics["wins"] / (self.metrics["wins"]+self.metrics["losses"]) * 100) if (self.metrics["wins"]+self.metrics["losses"]) > 0 else 0
-        kpi = f"ROI: {roi:.2f}% | MDD: {self.metrics['mdd']*100:.2f}% | WinRate: {wr:.1f}%\nTotal Fee: ${self.metrics['cum_commission']:.2f}"
-        ax1.text(0.02, 0.95, kpi, transform=ax1.transAxes, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-        ax1.set_title(f"TRADING CONSOLE [{self.mode}] - Total Wealth")
+            ax1.axvline(x=swap, color='red', linestyle=':')
+
+        ax1.set_title(f"Main Dashboard [{self.mode}]")
         ax1.legend(loc='upper left')
 
-        # 2. 가격 및 매매 마커
+        # KPI
+        roi = (w_net[-1] - self.start_wealth) / self.start_wealth * 100
+        total_steps = self.metrics["wins"] + self.metrics["losses"]
+        win_rate = (self.metrics["wins"] / total_steps * 100) if total_steps > 0 else 0.0
+        kpi_text = f"ROI: {roi:.2f}%\nMDD: {self.metrics['mdd']*100:.2f}%\nWinRate: {win_rate:.1f}%\nFee: ${self.metrics['cum_commission']:.2f}"
+        ax1.text(0.02, 0.5, kpi_text, transform=ax1.transAxes, bbox=dict(facecolor='white', alpha=0.8))
+
+        # 2. Price & Trades
         ax2 = fig.add_subplot(gs[1], sharex=ax1)
-        ax2.plot(steps, prices, color="black", alpha=0.6, label="Asset Price")
-        buys = [e for e in self.data["trade_events"] if e['type'] == 'buy']
-        sells = [e for e in self.data["trade_events"] if e['type'] == 'sell']
-        if buys: ax2.scatter([e['step'] for e in buys], [e['price'] for e in buys], marker='^', color='green', s=120, label='BUY', zorder=5)
-        if sells: ax2.scatter([e['step'] for e in sells], [e['price'] for e in sells], marker='v', color='red', s=120, label='SELL', zorder=5)
-        ax2.set_title("Price & Trade Execution")
+        ax2.plot(steps, prices, color="black", alpha=0.6)
+
+        buy_steps = [e['step'] for e in self.data["trade_events"] if e['type'] == 'buy']
+        buy_prices = [e['price'] for e in self.data["trade_events"] if e['type'] == 'buy']
+        sell_steps = [e['step'] for e in self.data["trade_events"] if e['type'] == 'sell']
+        sell_prices = [e['price'] for e in self.data["trade_events"] if e['type'] == 'sell']
+
+        if buy_steps: ax2.scatter(buy_steps, buy_prices, marker='^', color='green', s=100, label='Buy')
+        if sell_steps: ax2.scatter(sell_steps, sell_prices, marker='v', color='red', s=100, label='Sell')
         ax2.legend()
 
-        # 3. 포트폴리오 비중 & 액션
+        # 3. Action
         ax3 = fig.add_subplot(gs[2], sharex=ax1)
-        cash = np.array(self.data["cash_new"])
-        asset = np.array(self.data["asset_val_new"])
-        ax3.stackplot(steps, cash, asset, labels=["Cash", "Asset Value"], colors=["#A8E6CF", "#FFD3B6"], alpha=0.6)
-        ax3_twin = ax3.twinx()
-        ax3_twin.plot(steps, self.data["action_new"], color="magenta", linewidth=1, label="Target Weight")
-        ax3_twin.set_ylim(-0.05, 1.05)
-        ax3.set_title("Portfolio Mix & Agent Decision")
-        ax3.legend(loc='upper left'); ax3_twin.legend(loc='upper right')
-
-        # 4. 학습 지표 (SDE & RL Loss)
-        ax4 = fig.add_subplot(gs[3], sharex=ax1)
-        sde_l = np.array(self.data["sde_loss"])
-        ax4.plot(steps, sde_l, color="purple", label="SDE MSE Loss", alpha=0.8)
-        if len(sde_l) > 50:
-            ax4.plot(steps, pd.Series(sde_l).rolling(50).mean(), color="yellow", label="SDE MA(50)")
-        ax4.set_yscale('log')
-        ax4.set_title("Learning Performance (SDE Loss)")
-        ax4.legend()
+        ax3.plot(steps, self.data["action_new"], color="magenta")
+        ax3.set_ylim(-0.1, 1.1)
 
         plt.tight_layout()
         plt.savefig(f"{self.save_dir}/live_dashboard.png")
+        plt.close(fig)
+
+    def plot_portfolio(self):
+        steps = np.array(self.data["step"])
+        cash = np.array(self.data["cash_new"])
+        asset = np.array(self.data["asset_val_new"])
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(steps, cash, label="Cash (USDT)", color="green")
+        ax.plot(steps, asset, label="Asset Value (USDT)", color="orange")
+        ax.stackplot(steps, cash, asset, labels=["Cash", "Asset"], colors=["green", "orange"], alpha=0.1)
+
+        ax.set_title("Portfolio Composition Change")
+        ax.set_ylabel("Value")
+        ax.legend()
+
+        plt.tight_layout()
+        plt.savefig(f"{self.save_dir}/live_portfolio.png")
+        plt.close(fig)
+
+    def plot_sde(self):
+        # SDE Learning Performance (Reconstruction/Prediction Error)
+        steps = np.array(self.data["step"])
+        errors = np.array(self.data["sde_error"])
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(steps, errors, label="SDE Prediction/Recon Error (MSE)", color="purple")
+
+        # Smooth curve
+        if len(errors) > 20:
+            avg = pd.Series(errors).rolling(20).mean()
+            ax.plot(steps, avg, label="Moving Avg (20)", color="yellow", linewidth=2)
+
+        ax.set_title("SDE Model Performance (Training/Inference Error)")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("MSE Loss")
+        ax.set_yscale('log') # Log scale for loss
+        ax.legend()
+
+        plt.tight_layout()
+        plt.savefig(f"{self.save_dir}/live_sde.png")
+        plt.close(fig)
+
+    def plot_rl(self):
+        steps = np.array(self.data["step"])
+        actor = np.array(self.data["actor_loss"])
+        critic = np.array(self.data["critic_loss"])
+        rewards = np.array(self.data["reward"])
+
+        fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
+
+        axes[0].plot(steps, actor, label="Actor Loss", color="blue")
+        axes[0].set_title("RL Actor Loss")
+
+        axes[1].plot(steps, critic, label="Critic Loss", color="red")
+        axes[1].set_title("RL Critic Loss")
+
+        axes[2].plot(steps, rewards, label="Reward", color="green", alpha=0.3)
+        if len(rewards) > 20:
+            avg = pd.Series(rewards).rolling(20).mean()
+            axes[2].plot(steps, avg, label="Reward MA(20)", color="black")
+        axes[2].set_title("Reward History")
+
+        plt.tight_layout()
+        plt.savefig(f"{self.save_dir}/live_rl.png")
         plt.close(fig)

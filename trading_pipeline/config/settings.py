@@ -10,18 +10,18 @@ class Config:
     API_SECRET = os.getenv('EXCHANGE_API_SECRET', '')
     SYMBOL = "BTC/USDT"
 
-    # --- Architecture Settings ---
-    # RL Agent Hidden Layers
-    RL_HIDDEN_DIMS = [256, 128, 64]
+    # --- RL Algorithm Selection ---
+    # Options: 'PPO', 'SAC'
+    RL_ALGO = os.getenv('RL_ALGO', 'SAC').upper()
 
-    # SDE Network Settings
+    # --- Architecture Settings ---
+    RL_HIDDEN_DIMS = [256, 256] # Deeper for SAC usually better
     LATENT_DIM = 8
-    SDE_HIDDEN_DIM = 128 # Width of internal Drift/Diffusion nets
+    SDE_HIDDEN_DIM = 64
 
     # --- Device Settings ---
     CUDA_INDEX = int(os.getenv('CUDA_INDEX', '0'))
 
-    # Auto-detect GPU
     if torch.cuda.is_available():
         DEVICE = torch.device(f'cuda:{CUDA_INDEX}')
         print(f"CUDA Available. Using GPU: {torch.cuda.get_device_name(CUDA_INDEX)}")
@@ -30,21 +30,28 @@ class Config:
         print("CUDA not available. Using CPU.")
 
     # --- Hyperparameters ---
-    # Training
+    # Common
     SDE_WARMUP_EPOCHS = 5
-    RL_LEARNING_RATE = 1e-4
-    RL_BATCH_SIZE = 20
-    REPLAY_BUFFER_SIZE = 30
-
-    # RL Algo (PPO/PG)
+    RL_LEARNING_RATE = 3e-4 # Standard for SAC/PPO
+    RL_BATCH_SIZE = 256 # Larger batch for SAC
+    REPLAY_BUFFER_SIZE = 100000 # SAC needs large buffer
     GAMMA = 0.99
+
+    # PPO Specific
     PPO_EPSILON = 0.2
+    PPO_K_EPOCHS = 10
+    PPO_ENTROPY_COEF = 0.01
+
+    # SAC Specific
+    SAC_TAU = 0.005
+    SAC_ALPHA = 0.2
+    SAC_AUTO_ENTROPY_TUNING = True
 
     # Risk Management
-    STOP_LOSS_THRESHOLD = 0.05  # 5%
-    COMMISSION_RATE = 0.001     # 0.1%
+    STOP_LOSS_THRESHOLD = 0.05
+    COMMISSION_RATE = 0.001
 
-    # Dimensions (Derived/Fixed)
+    # Dimensions
     STATE_DIM = 21
     PORTFOLIO_DIM = 2
     ACTION_DIM = 1
@@ -52,15 +59,8 @@ class Config:
     # Data
     LOOKBACK_WINDOW = 100
 
-
-    # config/settings.py 에 추가
-    OFFLINE_DATA_SIZE = 30      # 오프라인 학습을 위해 기다릴 최소 데이터 양
-    OFFLINE_SDE_EPOCHS = 1      # SDE 오프라인 학습 횟수
-    OFFLINE_RL_EPOCHS = 1        # RL 오프라인 학습 횟수
-
-
     @classmethod
     def validate(cls):
         if cls.MODE == 'REAL':
             if not cls.API_KEY or not cls.API_SECRET:
-                print("WARNING: REAL mode selected but API Keys not found in env vars.")
+                print("WARNING: REAL mode selected but API Keys not found.")
